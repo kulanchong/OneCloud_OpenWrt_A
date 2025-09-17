@@ -1,193 +1,78 @@
-name: build-coolsnowwolf-lede-imagebuilder
+name: Build OpenWrt for OneCloud (WS1608)
 
 on:
   workflow_dispatch:
     inputs:
-      repo-ref:
-        description: 'coolsnowwolf/lede 分支或 tag（例如 master 或 v17.01.4）'
-        required: false
+      lede_branch:
+        description: 'LEDE 分支名称'
+        required: true
         default: 'master'
       target:
-        description: 'TARGET（例如 arm）'
+        description: '目标架构'
         required: true
         default: 'arm'
       subtarget:
-        description: 'SUBTARGET（例如 amlogic）'
+        description: '子架构'
         required: true
         default: 'amlogic'
       profile:
-        description: 'PROFILE（设备 profile 名称，可留空）'
-        required: false
-        default: ''
-      make-jobs:
-        description: '并行编译任务数 (建议 1-2 在 Actions 上)'
+        description: '设备配置文件'
+        required: true
+        default: 'onecloud'
+      make_jobs:
+        description: '并行编译任务数'
         required: false
         default: '2'
-      use-local-config:
-        description: '如果仓库根目录放了 lede.config (自定义 .config)，设 true 则使用'
-        required: false
-        default: 'false'
 
 jobs:
-  build-imagebuilder:
+  build:
     runs-on: ubuntu-latest
-    env:
-      LEDE_REPO: https://github.com/coolsnowwolf/lede.git
     steps:
-      - name: Checkout workflow repository
+      - name: Checkout LEDE repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          repository: coolsnowwolf/lede
+          ref: ${{ github.event.inputs.lede_branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
-          sudo apt-get update -y
+          sudo apt-get update
           sudo apt-get install -y build-essential ccache gawk git subversion \
             libncurses5-dev libssl-dev python3 python3-setuptools python3-pip \
             unzip zlib1g-dev wget rsync gcc g++ make gettext automake \
             libtool binutils bzip2 file g++-multilib bc \
             bison flex gperf python3-venv zstd libelf-dev u-boot-tools
 
-      - name: Clone coolsnowwolf/lede (shallow)
+      - name: Prepare build environment
         run: |
-          set -e
-          REF="${{ github.event.inputs.repo-ref }}"
-          if [ -z "$REF" ]; then REF="master"; fi
-          git clone --depth=1 --branch "$REF" "${LEDE_REPO}" lede-src
-
-      - name: Show basic repo info
-        working-directory: lede-src
-        run: |
-          echo "Checked out:"
-          git rev-parse --abbrev-ref HEAD || true
-          git rev-parse --short HEAD || true
-          ls -la
-
-      - name: Use provided lede.config if requested
-        if: ${{ github.event.inputs.use-local-config == 'true' }}
-        working-directory: lede-src
-        run: |
-          if [ -f ../lede.config ]; then
-            echo "Copying lede.config from workflow repo root to lede-src/.config"
-            cp ../lede.config .config
-          elif [ -f lede.config ]; then
-            echo "Copying lede.config from lede-src root ."
-          else
-            echo "lede.config not found in repo root. Continuing without it."
-          fi
-
-      - name: Prepare feeds and default config
-        working-directory: lede-src
-        run: |
-          set -e
+          git clone https://github.com/coolsnowwolf/lede.git lede-src
+          cd lede-src
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 如果没有提供 .config，通过输入的 target/subtarget/profile 尝试生成基础 .config
-          if [ ! -f .config ]; then
-            echo "No .config found — generating minimal .config from inputs"
-            TARGET="${{ github.event.inputs.target }}"
-            SUBTARGET="${{ github.event.inputs.subtarget }}"
-            PROFILE="${{ github.event.inputs.profile }}"
-
-            if [ -z "$TARGET" ] || [ -z "$SUBTARGET" ]; then
-              echo "ERROR: target or subtarget empty. Provide them when dispatching the workflow."
-              exit 1
-            fi
-
-            # 生成最小的 .config 条目（注意：不同树的选项命名可能略有差别）
-            echo "CONFIG_TARGET_${TARGET}=y" > .config || true
-            echo "CONFIG_TARGET_${TARGET}_${SUBTARGET}=y" >> .config || true
-            if [ -n "$PROFILE" ]; then
-              # 常见的 profile 写法（可能需要你后续手动微调或直接放置 lede.config）
-              SAFE_PROFILE="$(echo "$PROFILE" | sed 's/[^a-zA-Z0-9_]/_/g')"
-              echo "CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${SAFE_PROFILE}=y" >> .config || true
-            fi
-
-            make defconfig || true
-          else
-            echo ".config exists — skipping auto generation"
-          fi
-
-      - name: Build ImageBuilder (verbose, single-thread)
-        working-directory: lede-src
-        env:
-          MAKEFLAGS: "-j1"
+      - name: Configure build
         run: |
-          set -e
-          echo "开始（verbose 模式）构建 imagebuilder，并将输出写入 build.log ..."
-          # 确保 feeds 已处理（冗余但安全）
-          ./scripts/feeds update -a || true
-          ./scripts/feeds install -a || true
+          cd lede-src
+          make defconfig
+          make menuconfig
+          # 选择目标设备配置文件
+          make target/${{ github.event.inputs.target }}-${{ github.event.inputs.subtarget }}-${{ github.event.inputs.profile }}.config
 
-          # 清理旧产物（可选）
-          make clean || true
+      - name: Build firmware
+        run: |
+          cd lede-src
+          make -j${{ github.event.inputs.make_jobs }} V=s
 
-          # 以单线程 + 詳細輸出构建并把输出保存
-          # V=s 打印子命令，-j1 避免并发造成模糊日志
-          if ! make V=s -j1 imagebuilder 2>&1 | tee build.log; then
-            echo "构建失败 — 将上传 build.log 以便分析"
-            # 导出一些诊断信息（小尺寸），避免上传全部 tmp（可能太大）
-            echo "=== ls -la bin/targets ===" >> build.log || true
-            ls -la bin/targets >> build.log || true
-            echo "=== du -sh tmp staging_dir (summary) ===" >> build.log || true
-            du -sh tmp 2>/dev/null | head -n 20 >> build.log || true
-            du -sh staging_dir 2>/dev/null | head -n 20 >> build.log || true
-            # 继续失败（让 step 标记为失败，后面的 upload-artifact 还是会运行）
-            exit 2
-          fi
+      - name: Generate ImageBuilder
+        run: |
+          cd lede-src
+          make imagebuilder
 
-      - name: Upload verbose build log
-        if: always()
+      - name: Upload firmware and ImageBuilder
         uses: actions/upload-artifact@v4
         with:
-          name: lede-build-log
-          path: lede-src/build.log
-
-      - name: Upload debug listings
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lede-build-debug-lists
+          name: openwrt-firmware
           path: |
-            lede-src/bin/targets
-            lede-src/tmp || true
-            lede-src/staging_dir || true
-
-      - name: List produced artifacts
-        working-directory: lede-src
-        run: |
-          set -e
-          echo "bin/targets 目录内容："
-          ls -la bin/targets || true
-          echo "查找 imagebuilder 文件："
-          find bin/targets -type f -name 'openwrt-imagebuilder*' -print || true
-
-      - name: Package artifacts
-        working-directory: lede-src
-        run: |
-          set -e
-          # 尝试打包找到的 imagebuilder 文件；若没有，打包整个 bin 目录便于排查
-          FOUND=$(find bin/targets -type f -name 'openwrt-imagebuilder*' | head -n 1 || true)
-          if [ -n "$FOUND" ]; then
-            echo "Found imagebuilder: $FOUND"
-            mkdir -p artifacts
-            cp "$FOUND" artifacts/
-            tar -C artifacts -czf openwrt-imagebuilder-artifacts.tar.gz .
-          else
-            echo "No imagebuilder tar found; packing bin/targets for debug"
-            tar -czf openwrt-bin-targets-debug.tar.gz bin/targets || true
-          fi
-
-      - name: Upload artifact(s)
-        uses: actions/upload-artifact@v4
-        with:
-          name: lede-imagebuilder-artifacts
-          path: |
-            lede-src/openwrt-imagebuilder-artifacts.tar.gz
-            lede-src/openwrt-bin-targets-debug.tar.gz
-
-      - name: Print note
-        run: |
-          echo "如果构建成功，artifact 名称为 lede-imagebuilder-artifacts，可在 Actions => Artifacts 下载。"
-          echo "如果没有 imagebuilder，请检查 lede.config（建议在本地运行 make menuconfig 并把生成的 .config 保存为 lede.config 放到仓库根目录）"
+            lede-src/bin/targets/${{ github.event.inputs.target }}/${{ github.event.inputs.subtarget }}/imagebuilder/*
+            lede-src/bin/targets/${{ github.event.inputs.target }}/${{ github.event.inputs.subtarget }}/*.{bin,img}
