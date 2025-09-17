@@ -196,26 +196,33 @@ jobs:
         $GITHUB_WORKSPACE/sh/openclash32.sh || true
         $GITHUB_WORKSPACE/$DIY_P5_SH || true
 
-    - name: 准备 .config（强制开启 ImageBuilder）
-      working-directory: ./openwrt
-      run: |
-        rm -f .config*
-        if [ -f "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" ]; then
-          cp "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" .config
-        else
-          echo "未找到 $GITHUB_WORKSPACE/${{ env.OWRT_CFG }}"; exit 1
-        fi
+- name: 准备 .config（开启 ImageBuilder）
+  working-directory: ./openwrt
+  run: |
+    set -e
+    rm -f .config*
+    if [ -f "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" ]; then
+      cp "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" .config
+    else
+      echo "未找到 $GITHUB_WORKSPACE/${{ env.OWRT_CFG }}"; exit 1
+    fi
 
-        # 用官方脚本强制开启 IB
-        ./scripts/config --file .config -e IB
-        # 统一缺省项；用 olddefconfig 避免 IB 被 defconfig 误关
-        make olddefconfig
+    # 直接写入 IB 选项，再展开配置
+    if ! grep -q '^CONFIG_IB=y' .config; then
+      echo 'CONFIG_IB=y' >> .config
+    fi
 
-        echo "==== 检查 CONFIG_IB ===="
-        grep -E '^CONFIG_IB=y' .config || (echo 'ERROR: CONFIG_IB 未开启；当前 target 可能不支持 IB' && exit 2)
+    # 展开默认项（注意用 defconfig）
+    make defconfig
 
-        echo "==== diffconfig（便于审计） ===="
-        ./scripts/diffconfig.sh || true
+    echo "==== 检查 CONFIG_IB ===="
+    if ! grep -q '^CONFIG_IB=y' .config; then
+      echo 'ERROR: CONFIG_IB 未生效，说明当前 target/分支不支持 IB（或被 defconfig 关掉）'; exit 2
+    fi
+
+    echo "==== diffconfig（便于审计） ===="
+    ./scripts/diffconfig.sh || true
+
 
     - name: 下载源码包
       working-directory: ./openwrt
