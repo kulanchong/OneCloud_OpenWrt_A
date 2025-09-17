@@ -26,12 +26,12 @@ on:
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
 
-  # ===== 你的源与脚本/文件（保持和原仓库一致） =====
+  # ===== 保持与你原仓库一致的变量 =====
   REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: openwrt-24.10
   FEEDS_CONF: feeds.conf.default
 
-  # 基础 config（按 brun_type 二选一）
+  # 不同内核/平台对应两套基础配置（按 brun_type 选择）
   CONFIG_FILE: Config/quicker.config
   CONFIG_FILE_AMLOGIC: Config/quicker-amlogic.config
 
@@ -196,33 +196,30 @@ jobs:
         $GITHUB_WORKSPACE/sh/openclash32.sh || true
         $GITHUB_WORKSPACE/$DIY_P5_SH || true
 
-- name: 准备 .config（开启 ImageBuilder）
-  working-directory: ./openwrt
-  run: |
-    set -e
-    rm -f .config*
-    if [ -f "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" ]; then
-      cp "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" .config
-    else
-      echo "未找到 $GITHUB_WORKSPACE/${{ env.OWRT_CFG }}"; exit 1
-    fi
+    - name: 准备 .config（开启 ImageBuilder）
+      working-directory: ./openwrt
+      run: |
+        set -e
+        rm -f .config*
+        if [ -f "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" ]; then
+          cp "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" .config
+        else
+          echo "未找到 $GITHUB_WORKSPACE/${{ env.OWRT_CFG }}"; exit 1
+        fi
 
-    # 直接写入 IB 选项，再展开配置
-    if ! grep -q '^CONFIG_IB=y' .config; then
-      echo 'CONFIG_IB=y' >> .config
-    fi
+        # 直接写入 IB 选项，再展开
+        if ! grep -q '^CONFIG_IB=y' .config; then
+          echo 'CONFIG_IB=y' >> .config
+        fi
+        make defconfig
 
-    # 展开默认项（注意用 defconfig）
-    make defconfig
+        echo "==== 检查 CONFIG_IB ===="
+        if ! grep -q '^CONFIG_IB=y' .config; then
+          echo 'ERROR: CONFIG_IB 未生效，说明当前 target/分支不支持 IB（或被 defconfig 关掉）'; exit 2
+        fi
 
-    echo "==== 检查 CONFIG_IB ===="
-    if ! grep -q '^CONFIG_IB=y' .config; then
-      echo 'ERROR: CONFIG_IB 未生效，说明当前 target/分支不支持 IB（或被 defconfig 关掉）'; exit 2
-    fi
-
-    echo "==== diffconfig（便于审计） ===="
-    ./scripts/diffconfig.sh || true
-
+        echo "==== diffconfig（便于审计） ===="
+        ./scripts/diffconfig.sh || true
 
     - name: 下载源码包
       working-directory: ./openwrt
@@ -236,15 +233,17 @@ jobs:
       working-directory: ./openwrt
       env:
         MAKEFLAGS: "-j1"
-      continue-on-error: true
       run: |
-        set -e
+        set +e
         echo "=== make imagebuilder (V=s, -j1) ==="
         make V=s -j1 imagebuilder 2>&1 | tee build-ib.log
-        echo "ib_result=success" >> $GITHUB_OUTPUT
+        status=$?
+        echo "ib_status=$status" >> $GITHUB_OUTPUT
+        # 不在此处失败，让下一个步骤判断是否回退
+        exit 0
 
     - name: 如果上一步失败则回退到全量 make（也会产出 IB）
-      if: ${{ steps.try_ib.outcomes.failure || steps.try_ib.conclusion == 'failure' || steps.try_ib.outputs.ib_result != 'success' }}
+      if: ${{ steps.try_ib.outputs.ib_status != '0' }}
       working-directory: ./openwrt
       env:
         MAKEFLAGS: "-j$(nproc)"
@@ -287,5 +286,5 @@ jobs:
           玩客云 OneCloud（${{ env.OWRT_brun_type }}）ImageBuilder 打包
           - 源码：${{ env.OWRT_SOURCE }}
           - 分支：${{ env.OWRT_BRANCH }}
-          - 说明：本工作流优先 make imagebuilder；若目标缺失自动回退到全量 make 也会产出 IB。
+          - 说明：优先 make imagebuilder；若目标缺失自动回退到全量 make 也会产出 IB。
         artifacts: openwrt/outfile/*
