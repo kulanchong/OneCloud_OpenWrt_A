@@ -1,0 +1,288 @@
+name: 一站式精简onecloud【编译 ImageBuilder】
+
+on:
+  workflow_dispatch:
+    inputs:
+      brun_type:
+        type: choice
+        description: 选择内核/平台（用于替换 target/linux）
+        required: true
+        default: "meson6.6"
+        options:
+        - amlogic6.12
+        - amlogic6.6
+        - meson6.6
+        #- meson6.12
+
+      OP_IP:
+        description: '玩客云IP选项'
+        required: true
+        default: '192.168.1.110'
+        type: string
+
+      SERVER_IP:
+        description: '主路由IP选项'
+        required: true
+        default: '192.168.1.1'
+        type: string
+
+env:
+  GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+
+  # ===== 你原来的源与脚本/文件 =====
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  FEEDS_CONF: feeds.conf.default
+
+  # 原本用于固件的配置，这里依然拿来生成 ImageBuilder
+  CONFIG_FILE: Config/quicker.config
+  DIY_P1_SH: sh/new_immortalwrt.sh
+  DIY_P2_SH: sh/lean2.sh
+  DIY_P3_SH: sh/remove.sh
+  DIY_P4_SH: sh/edit_files.sh
+  DIY_P5_SH: sh/python3.patch.sh
+
+  OWRT_IP: ${{ github.event.inputs.OP_IP }}
+  OWRT_SERVER_IP: ${{ github.event.inputs.SERVER_IP }}
+  OWRT_NAME: OneCloud
+  OWRT_FILES: onecloud/files
+  OWRT_brun_type: ${{ github.event.inputs.brun_type }}
+
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build_imagebuilder:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 清理服务器空间(Ubuntu)
+      uses: rmoyulong/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: 检查项目
+      uses: actions/checkout@main
+
+    - name: 检查分配的服务器性能
+      run: |
+        echo "--------------------------CPU--------------------------"
+        echo "物理CPU数：$(grep -c ^processor /proc/cpuinfo || true)"
+        lscpu || true
+        echo "--------------------------内存--------------------------"
+        sudo lshw -short -C memory | grep GiB || true
+        echo "--------------------------磁盘--------------------------"
+        df -hT
+
+    - name: 初始化编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update --fix-missing
+        sudo -E apt-get -qq full-upgrade
+        # 兼容 24.04 / 22.04
+        sudo -E apt-get -qq install -y \
+          build-essential ccache gawk git subversion \
+          libncurses5-dev libssl-dev python3 python3-setuptools python3-pip \
+          unzip zlib1g-dev wget rsync gcc g++ make gettext automake \
+          libtool binutils bzip2 file g++-multilib bc \
+          bison flex gperf python3-venv zstd libelf-dev u-boot-tools \
+          dos2unix
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        df -Th
+
+    - name: 初始化变量
+      run: |
+        export OWRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")
+        export OWRT_SOURCE=$(echo $REPO_URL | cut -d '/' -f 5-)
+
+        echo "OWRT_URL=$REPO_URL" >> $GITHUB_ENV
+        echo "OWRT_BRANCH=$REPO_BRANCH" >> $GITHUB_ENV
+        echo "OWRT_DATE=$OWRT_DATE" >> $GITHUB_ENV
+        echo "OWRT_SOURCE=$OWRT_SOURCE" >> $GITHUB_ENV
+        echo "OWRT_NAME=$OWRT_NAME" >> $GITHUB_ENV
+        echo "OWRT_IP=$OWRT_IP" >> $GITHUB_ENV
+        echo "OWRT_SERVER_IP=$OWRT_SERVER_IP" >> $GITHUB_ENV
+        echo "DIY_P1_SH=$DIY_P1_SH" >> $GITHUB_ENV
+        echo "DIY_P2_SH=$DIY_P2_SH" >> $GITHUB_ENV
+        echo "DIY_P3_SH=$DIY_P3_SH" >> $GITHUB_ENV
+        echo "DIY_P4_SH=$DIY_P4_SH" >> $GITHUB_ENV
+        echo "DIY_P5_SH=$DIY_P5_SH" >> $GITHUB_ENV
+        echo "OWRT_brun_type=$OWRT_brun_type" >> $GITHUB_ENV
+        echo "${{ env.OWRT_brun_type }}"
+
+        # 选择用哪个 config（和你原来保持一致）
+        if [[ "${{ env.OWRT_brun_type }}" == "meson6.6" ]]; then
+          OWRT_CFG="Config/quicker.config"
+        elif [[ "${{ env.OWRT_brun_type }}" == "meson6.12" ]]; then
+          OWRT_CFG="Config/quicker.config"
+        elif [[ "${{ env.OWRT_brun_type }}" == "amlogic6.12" ]]; then
+          OWRT_CFG="Config/quicker-amlogic.config"
+        elif [[ "${{ env.OWRT_brun_type }}" == "amlogic6.6" ]]; then
+          OWRT_CFG="Config/quicker-amlogic.config"
+        else
+          echo "没有选择编译任何类型"; exit 1
+        fi
+        echo "OWRT_CFG=$OWRT_CFG" >> $GITHUB_ENV
+
+    - name: 克隆源仓库
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: 检查脚本
+      run: |
+        cd ./sh
+        dos2unix ./*.sh
+        chmod +x ./*.sh
+
+    - name: 设置订阅源 & 替换 target/linux
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        cd openwrt
+
+        # 按你原来的选择替换 target/linux
+        if [[ "${{ env.OWRT_brun_type }}" == "meson6.6" ]]; then
+          mv $GITHUB_WORKSPACE/lede6.6/target/linux/meson target/linux
+          chmod -Rf 755 target/linux/meson
+          echo "use meson6.6"
+        elif [[ "${{ env.OWRT_brun_type }}" == "meson6.12" ]]; then
+          mv $GITHUB_WORKSPACE/lede6.12/target/linux/meson target/linux
+          chmod -Rf 755 target/linux/meson
+          echo "use meson6.12"
+        elif [[ "${{ env.OWRT_brun_type }}" == "amlogic6.12" ]]; then
+          mv $GITHUB_WORKSPACE/lede6.6/target/linux/amlogic target/linux
+          chmod -Rf 755 target/linux/amlogic
+          echo "use amlogic6.12"
+        elif [[ "${{ env.OWRT_brun_type }}" == "amlogic6.6" ]]; then
+          mv $GITHUB_WORKSPACE/lede6.6/target/linux/amlogic target/linux
+          chmod -Rf 755 target/linux/amlogic
+          echo "use amlogic6.6"
+        fi
+
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+        echo "COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+    - name: 启动缓存[第二次起生效]
+      uses: rmoyulong/cachewrtbuild@main
+      with:
+        ccache: 'true'
+        prefix: ${{ github.workspace }}/openwrt
+        mixkey: ${{ env.OWRT_brun_type }}/tree/${{ env.OWRT_BRANCH }}?device=${{ env.OWRT_CFG }}
+
+    - name: 安装订阅源
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 注入自定义（文件/脚本）
+      working-directory: ./openwrt
+      run: |
+        # 这部分保留，但只影响 ImageBuilder 中的 files 模板/默认配置
+        curl -L -o package/base-files/files/etc/banner https://raw.githubusercontent.com/rmoyulong/AX6-Actions_Lede/master/ax6/cats_banner || true
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+        $GITHUB_WORKSPACE/$DIY_P3_SH
+
+        dos2unix $GITHUB_WORKSPACE/$OWRT_FILES/etc/*.sh || true
+        dos2unix $GITHUB_WORKSPACE/$OWRT_FILES/etc/rc.* || true
+        chmod -Rf 755 $GITHUB_WORKSPACE/$OWRT_FILES/etc/*.sh || true
+        chmod -Rf 755 $GITHUB_WORKSPACE/$OWRT_FILES/etc/rc.* || true
+        chmod -Rf 755 $GITHUB_WORKSPACE/$OWRT_FILES/etc/init.d/* || true
+
+        # 确保 files/ 存在并把你的定制塞进去（用于 IB 默认 rootfs）
+        mkdir -p ./files
+        cp -rf $GITHUB_WORKSPACE/$OWRT_FILES/* ./files || true
+
+        # 设置主路由/IP
+        $GITHUB_WORKSPACE/$DIY_P4_SH "${{ env.OWRT_IP }}" "${{ env.OWRT_SERVER_IP }}" || true
+
+        # 额外脚本（按需），不会影响“有没有 IB 目标”
+        $GITHUB_WORKSPACE/sh/openclash32.sh || true
+        $GITHUB_WORKSPACE/$DIY_P5_SH || true
+
+    - name: 准备 .config（开启 ImageBuilder）
+      working-directory: ./openwrt
+      run: |
+        rm -f .config*
+        # 用你选择的 config 作为基底
+        if [ -f "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" ]; then
+          cp "$GITHUB_WORKSPACE/${{ env.OWRT_CFG }}" .config
+        else
+          echo "未找到 $GITHUB_WORKSPACE/${{ env.OWRT_CFG }}"; exit 1
+        fi
+        # 关键：开启 IB
+        echo "CONFIG_IB=y" >> .config
+        # 统一缺省项
+        make defconfig
+        # 打印确认
+        grep -E '^CONFIG_IB=' .config || true
+
+    - name: 下载源码包
+      working-directory: ./openwrt
+      run: |
+        make download -j$(nproc)
+        find dl -size -1024c -exec ls -l {} \; || true
+        find dl -size -1024c -exec rm -f {} \; || true
+
+    - name: 构建 ImageBuilder（verbose）
+      working-directory: ./openwrt
+      env:
+        MAKEFLAGS: "-j1"
+      run: |
+        set -e
+        echo "=== make imagebuilder (V=s, -j1) ==="
+        if ! make V=s -j1 imagebuilder 2>&1 | tee build-ib.log; then
+          echo "ImageBuilder 构建失败，请查看 build-ib.log"; exit 2
+        fi
+
+    - name: 汇总产物
+      working-directory: ./openwrt
+      run: |
+        echo "== 产物目录 =="
+        find bin/targets -maxdepth 3 -type d -print || true
+        echo "== ImageBuilder 包 =="
+        find bin/targets -type f -name 'openwrt-imagebuilder*' -print || true
+
+        mkdir -p outfile
+        # 拷贝 IB 包
+        find bin/targets -type f -name 'openwrt-imagebuilder*' -exec cp -v {} outfile/ \; || true
+        # 保存当前 .config 方便复用
+        cp -v .config outfile/config.used.txt || true
+
+    - name: 上传产物与日志
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: onecloud-imagebuilder-and-logs
+        path: |
+          openwrt/outfile
+          openwrt/build-ib.log
+          openwrt/bin/targets
+
+    # 如需发 Release（只发 IB 包），保留；不需要可删掉
+    - name: 发布 Release（仅 ImageBuilder）
+      if: ${{ env.UPLOAD_RELEASE == 'true' }}
+      uses: ncipollo/release-action@v1
+      with:
+        allowUpdates: true
+        token: ${{ secrets.GITHUB_TOKEN }}
+        tag: IB_${{ env.OWRT_SOURCE }}_${{ env.OWRT_DATE }}
+        body: |
+          玩客云 OneCloud（${{ env.OWRT_brun_type }}）ImageBuilder 打包
+          - 源码：${{ env.OWRT_SOURCE }}
+          - 分支：${{ env.OWRT_BRANCH }}
+          - 默认地址：${{ env.OWRT_IP }}（仅 files 默认配置相关）
+        artifacts: openwrt/outfile/*
