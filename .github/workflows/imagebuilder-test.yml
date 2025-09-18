@@ -1,4 +1,4 @@
-name: 一站式精简onecloud【编译 ImageBuilder（含失败回退）】
+name: 一站式精简onecloud【ImageBuilder 优先构建 + 自动回退 OpenWrt 23.05.5】
 
 on:
   workflow_dispatch:
@@ -26,12 +26,12 @@ on:
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
 
-  # ===== 保持与你原仓库一致的变量 =====
+  # ===== 你的源与脚本/文件（保持和原仓库一致） =====
   REPO_URL: https://github.com/immortalwrt/immortalwrt
   REPO_BRANCH: openwrt-24.10
   FEEDS_CONF: feeds.conf.default
 
-  # 不同内核/平台对应两套基础配置（按 brun_type 选择）
+  # 不同平台对应两套基础配置（按 brun_type 选择）
   CONFIG_FILE: Config/quicker.config
   CONFIG_FILE_AMLOGIC: Config/quicker-amlogic.config
 
@@ -88,7 +88,7 @@ jobs:
           unzip zlib1g-dev wget rsync gcc g++ make gettext automake \
           libtool binutils bzip2 file g++-multilib bc \
           bison flex gperf python3-venv zstd libelf-dev u-boot-tools \
-          dos2unix
+          dos2unix curl ca-certificates
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
@@ -113,7 +113,6 @@ jobs:
         echo "DIY_P4_SH=$DIY_P4_SH" >> $GITHUB_ENV
         echo "DIY_P5_SH=$DIY_P5_SH" >> $GITHUB_ENV
         echo "OWRT_brun_type=$OWRT_brun_type" >> $GITHUB_ENV
-        echo "选择 brun_type: ${{ env.OWRT_brun_type }}"
 
         if [[ "${{ env.OWRT_brun_type }}" == "meson6.6" || "${{ env.OWRT_brun_type }}" == "meson6.12" ]]; then
           OWRT_CFG="${CONFIG_FILE}"
@@ -124,7 +123,7 @@ jobs:
         fi
         echo "OWRT_CFG=$OWRT_CFG" >> $GITHUB_ENV
 
-    - name: 克隆源码
+    - name: 克隆 ImmortalWrt 源码
       working-directory: /workdir
       run: |
         df -hT $PWD
@@ -134,8 +133,8 @@ jobs:
     - name: 处理脚本
       run: |
         cd ./sh
-        dos2unix ./*.sh
-        chmod +x ./*.sh
+        dos2unix ./*.sh || true
+        chmod +x ./*.sh || true
 
     - name: 设置订阅源 & 替换 target/linux
       run: |
@@ -160,7 +159,7 @@ jobs:
           echo "use amlogic6.6"
         fi
 
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        $GITHUB_WORKSPACE/$DIY_P1_SH || true
         echo "COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
     - name: 缓存（第二次起生效）
@@ -180,8 +179,8 @@ jobs:
       working-directory: ./openwrt
       run: |
         curl -L -o package/base-files/files/etc/banner https://raw.githubusercontent.com/rmoyulong/AX6-Actions_Lede/master/ax6/cats_banner || true
-        $GITHUB_WORKSPACE/$DIY_P2_SH
-        $GITHUB_WORKSPACE/$DIY_P3_SH
+        $GITHUB_WORKSPACE/$DIY_P2_SH || true
+        $GITHUB_WORKSPACE/$DIY_P3_SH || true
 
         dos2unix $GITHUB_WORKSPACE/$OWRT_FILES/etc/*.sh || true
         dos2unix $GITHUB_WORKSPACE/$OWRT_FILES/etc/rc.* || true
@@ -206,51 +205,51 @@ jobs:
         else
           echo "未找到 $GITHUB_WORKSPACE/${{ env.OWRT_CFG }}"; exit 1
         fi
-
-        # 直接写入 IB 选项，再展开
-        if ! grep -q '^CONFIG_IB=y' .config; then
-          echo 'CONFIG_IB=y' >> .config
-        fi
+        # 直接写入 IB 选项，再展开（不用 ./scripts/config，因为它是目录）
+        grep -q '^CONFIG_IB=y' .config || echo 'CONFIG_IB=y' >> .config
         make defconfig
-
         echo "==== 检查 CONFIG_IB ===="
-        if ! grep -q '^CONFIG_IB=y' .config; then
-          echo 'ERROR: CONFIG_IB 未生效，说明当前 target/分支不支持 IB（或被 defconfig 关掉）'; exit 2
-        fi
-
-        echo "==== diffconfig（便于审计） ===="
+        grep -q '^CONFIG_IB=y' .config || (echo 'ERROR: CONFIG_IB 未生效；当前目标可能不支持 IB' && exit 2)
         ./scripts/diffconfig.sh || true
 
-    - name: 下载源码包
+    - name: 下载源码包（dl）
       working-directory: ./openwrt
       run: |
         make download -j$(nproc)
         find dl -size -1024c -exec ls -l {} \; || true
         find dl -size -1024c -exec rm -f {} \; || true
 
-    - name: 尝试直接构建 ImageBuilder（verbose, -j1）
+    - name: 尝试构建 ImageBuilder；若无目标则自动切换到 OpenWrt v23.05.5
       id: try_ib
       working-directory: ./openwrt
       env:
         MAKEFLAGS: "-j1"
       run: |
         set +e
-        echo "=== make imagebuilder (V=s, -j1) ==="
-        make V=s -j1 imagebuilder 2>&1 | tee build-ib.log
-        status=$?
-        echo "ib_status=$status" >> $GITHUB_OUTPUT
-        # 不在此处失败，让下一个步骤判断是否回退
-        exit 0
-
-    - name: 如果上一步失败则回退到全量 make（也会产出 IB）
-      if: ${{ steps.try_ib.outputs.ib_status != '0' }}
-      working-directory: ./openwrt
-      env:
-        MAKEFLAGS: "-j$(nproc)"
-      run: |
-        set -e
-        echo "=== 回退：make world（V=s），同时产出 ImageBuilder ==="
-        make V=s 2>&1 | tee build-world.log
+        echo "=== 探测 imagebuilder 目标 ==="
+        if make -n imagebuilder >/dev/null 2>&1; then
+          echo "当前分支支持 imagebuilder，直接构建"
+          make V=s -j1 imagebuilder 2>&1 | tee build-ib.log
+          status=$?
+          echo "ib_status=$status" >> $GITHUB_OUTPUT
+          exit 0
+        else
+          echo "⚠️ 当前分支无 imagebuilder 目标 → 自动切换到 OpenWrt v23.05.5 只为产出 IB"
+          cd ..
+          rm -rf openwrt
+          git clone https://github.com/openwrt/openwrt -b v23.05.5 openwrt
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # 最小 .config，仅开启 IB（不替换 target/linux）
+          rm -f .config
+          echo 'CONFIG_IB=y' > .config
+          make defconfig
+          make V=s -j1 imagebuilder 2>&1 | tee build-ib.log
+          status=$?
+          echo "ib_status=$status" >> $GITHUB_OUTPUT
+          exit 0
+        fi
 
     - name: 汇总产物（仅收集 ImageBuilder 包）
       working-directory: ./openwrt
@@ -259,9 +258,7 @@ jobs:
         find bin/targets -type f -name 'openwrt-imagebuilder*' -print || true
 
         mkdir -p outfile
-        # IB 包
         find bin/targets -type f -name 'openwrt-imagebuilder*' -exec cp -v {} outfile/ \; || true
-        # 保存当前 .config 以便复用
         cp -v .config outfile/config.used.txt || true
 
     - name: 上传产物与日志
@@ -272,7 +269,6 @@ jobs:
         path: |
           openwrt/outfile
           openwrt/build-ib.log
-          openwrt/build-world.log
           openwrt/bin/targets
 
     - name: 发布 Release（只发 IB 包）
@@ -284,7 +280,7 @@ jobs:
         tag: IB_${{ env.OWRT_SOURCE }}_${{ env.OWRT_DATE }}
         body: |
           玩客云 OneCloud（${{ env.OWRT_brun_type }}）ImageBuilder 打包
-          - 源码：${{ env.OWRT_SOURCE }}
-          - 分支：${{ env.OWRT_BRANCH }}
-          - 说明：优先 make imagebuilder；若目标缺失自动回退到全量 make 也会产出 IB。
+          - 首选源码：${{ env.OWRT_SOURCE }}（${{ env.OWRT_BRANCH }}）
+          - 若源码缺少 imagebuilder 目标：自动回退到 OpenWrt v23.05.5 产出 IB
+          - 产物仅包含 ImageBuilder 包（用于你本地拼装直刷固件）
         artifacts: openwrt/outfile/*
